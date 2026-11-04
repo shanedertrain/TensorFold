@@ -222,3 +222,7 @@ test {
     _ = @import("request_cost_test.zig");
     _ = @import("prompt_tool_turn_test.zig");
 }
+
+test {
+    _ = @import("models_idle_audit_test.zig");
+}
