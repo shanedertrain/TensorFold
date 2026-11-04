@@ -1,4 +1,4 @@
-//! The actual HfText route, using synthetic tokenizer files and committed Python encoding goldens.
+//! The actual HfText route, using synthetic tokenizer files; licensed output cases live in deepseek_fixture_test.zig.
 const std = @import("std");
 const json = @import("json");
 const api = @import("engine_api");
@@ -15,43 +15,6 @@ fn fixture(a: std.mem.Allocator, kind: []const u8) !f.Fixture {
     try out.tmp.dir.writeFile(t.io, .{ .sub_path = "tokenizer.json", .data = bytes });
     try out.tmp.dir.writeFile(t.io, .{ .sub_path = "config.json", .data = try std.fmt.allocPrint(a, "{{\"model_type\":\"{s}\"}}", .{kind}) });
     return out;
-}
-
-test "DeepSeek chat: missing Jinja uses the committed encoding.py text goldens" {
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp = try fixture(a, "deepseek_v4");
-    defer tmp.deinit();
-    var problem: []const u8 = "";
-    const hf = try HfText.load(a, t.io, tmp.path, null, a, &problem);
-    defer hf.deinit();
-    const lines = try std.Io.Dir.cwd().readFileAlloc(t.io, "zig/src/families/deepseek_v41/fixtures/serve/template.jsonl", a, .limited(4 << 20));
-    var it = std.mem.splitScalar(u8, lines, '\n');
-    var checked: usize = 0;
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        const c = (try json.parseText(a, line)).ok;
-        if (c.get("error").? != .null or !c.get("drop_thinking").?.bool or c.get("response_format").? != .null or c.get("image_text").? != .null) continue;
-        const thinking = c.get("thinking").?.bool;
-        var opts: @import("model_text.zig").RenderOptions = .{
-            .enable_thinking = thinking,
-            .add_generation_prompt = c.get("generation").?.bool,
-            .reasoning_effort = if (thinking) try json.stringify(a, c.get("budget").?, .{}) else null,
-        };
-        if (c.get("effort_field")) |effort| opts.reasoning_effort = switch (effort) {
-            .string, .int => |s| s,
-            else => unreachable,
-        };
-        if (c.get("tools")) |tools| if (tools == .array) {
-            opts.tools = tools;
-        };
-        const got = try hf.text().render(a, c.get("messages").?, opts, &problem);
-        try t.expectEqualStrings(c.get("expected").?.string, got.text);
-        checked += 1;
-    }
-    try t.expect(checked >= 20);
-    try t.expectEqual(@as(usize, 178), checked);
 }
 
 test "DeepSeek chat: native request control spellings stay masked and structural tokens stay trusted" {
@@ -79,8 +42,10 @@ test "DeepSeek chat: native request control spellings stay masked and structural
         }
         try t.expect(at > 0);
     }
-    try t.expect(std.mem.indexOf(u8, rendered.text, "<\u{200b}｜deepseek_image｜>") != null);
+    const image_at = std.mem.indexOf(u8, rendered.text, "<｜deepseek_image｜>").?;
+    try t.expect(!rendered.isTemplate(image_at, image_at + "<｜deepseek_image｜>".len));
     const ids = try rendered.encode(hf.text(), a, &problem);
+    for (ids) |id| try t.expect(id != hf.text().tokenId("<｜deepseek_image｜>").?);
     const user = hf.text().tokenId("<｜User｜>").?;
     var users: usize = 0;
     for (ids) |id| if (id == user) {
@@ -102,15 +67,18 @@ test "DeepSeek chat: Jinja and explicit overrides win and text-only image parts 
     const path = try std.fmt.allocPrint(a, "{s}/override.jinja", .{tmp.path});
     const override = try HfText.load(a, t.io, tmp.path, path, a, &problem);
     defer override.deinit();
+    try t.expect(!override.text().native_deepseek);
     try t.expectEqualStrings("overrideH", (try override.text().render(a, messages, .{}, &problem)).text);
     try tmp.tmp.dir.writeFile(t.io, .{ .sub_path = "chat_template.jinja", .data = "jinja{{ messages[0].content }}" });
     const jinja = try HfText.load(a, t.io, tmp.path, null, a, &problem);
     defer jinja.deinit();
+    try t.expect(!jinja.text().native_deepseek);
     try t.expectEqualStrings("jinjaH", (try jinja.text().render(a, messages, .{}, &problem)).text);
     var other = try fixture(a, "deepseek_v41");
     defer other.deinit();
     const native = try HfText.load(a, t.io, other.path, null, a, &problem);
     defer native.deinit();
+    try t.expect(native.text().native_deepseek);
     const images = (try json.parseText(a, "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"local\"}}]}]")).ok;
     try t.expectError(error.Template, native.text().render(a, images, .{}, &problem));
     try t.expect(std.mem.indexOf(u8, problem, "images are not served") != null);

@@ -19,8 +19,8 @@ pub const IMAGE = "<｜deepseek_image｜>";
 /// A zero-width space after ``<``: the same text, ordinary BPE tokens, never the image id.
 pub const IMAGE_ESCAPED = "<\u{200b}｜deepseek_image｜>";
 
-/// ``reasoning_effort`` names as the server reads them: none / minimal turn thinking off (the jinja maps medium to 62).
-pub const efforts = [_]struct { []const u8, ?u8 }{ .{ "none", null }, .{ "minimal", null }, .{ "low", 50 }, .{ "medium", 75 }, .{ "high", 75 }, .{ "xhigh", 100 }, .{ "max", 100 } };
+/// Named reasoning budgets observed at the chat endpoint; none turns thinking off.
+pub const efforts = [_]struct { []const u8, ?u8 }{ .{ "none", null }, .{ "minimal", 50 }, .{ "low", 50 }, .{ "medium", 75 }, .{ "high", 75 }, .{ "xhigh", 75 }, .{ "max", 100 } };
 pub const default_budget: u8 = 75;
 
 pub const Error = error{ Refused, OutOfMemory };
@@ -48,7 +48,7 @@ pub const Options = struct {
 /// A refusal's message (HTTP 400), set when ``render`` returns error.Refused.
 pub const Problem = struct { message: []const u8 = "" };
 
-/// A ``reasoning_effort`` value: null if refused, ``.{null}`` for none / minimal, else 1-100 (names trimmed, lower).
+/// A render budget: null if refused, .{null} for none, else 1-100; HTTP names are validated separately.
 pub fn effortOf(s: []const u8) ??u8 {
     var buf: [16]u8 = undefined;
     const trimmed = std.mem.trim(u8, s, " \t\n\r");
@@ -103,13 +103,9 @@ const R = struct {
     }
 
     fn request(r: *R, s: []const u8) Allocator.Error!void {
-        // Images are unsupported here; preserve the established plain-text image escape.
-        const escaped = if (std.mem.indexOf(u8, s, IMAGE) != null) try std.mem.replaceOwned(u8, r.a, s, IMAGE, IMAGE_ESCAPED) else null;
-        defer if (escaped) |bytes| r.a.free(bytes);
-        const plain = escaped orelse s;
         const start = r.out.items.len;
-        try r.put(plain);
-        if (r.track and plain.len > 0) try r.spans.append(r.a, .{ start, r.out.items.len });
+        try r.put(s);
+        if (r.track and s.len > 0) try r.spans.append(r.a, .{ start, r.out.items.len });
     }
 
     fn dumps(r: *R, v: Value) Allocator.Error!void {
@@ -200,24 +196,17 @@ fn qualifiedName(a: Allocator, fn_obj: Value, namespace: ?Value) Allocator.Error
     return bare;
 }
 
-/// The function definitions the system block lists, names qualified, in their own key order.
+/// Tool schemas use exactly name, description and parameters; unrelated function keys are not prompt text.
 fn toolFunction(r: *R, tool: Value) Error!Value {
     if (tool != .object) return r.refuse("tools must be a list of objects", .{});
     const inner = tool.get("function");
     const src = if (inner != null and inner.? == .object) inner.? else tool;
-    const fnv = try json.copyObject(r.a, src.object);
-    if (tool.get("namespace")) |ns| if (ns != .null) try fnv.put(r.a, "namespace", ns);
-    const ns = fnv.get("namespace");
-    const name = try qualifiedName(r.a, .{ .object = fnv }, ns) orelse return r.refuse("a tool has no name", .{});
-    try fnv.put(r.a, "name", .{ .string = name });
-    _ = fnv.orderedRemove("namespace");
-    if (ns) |n| if (n == .object) if (n.get("description")) |d| if (d.truthy()) {
-        const desc = try scalarText(r.a, d) orelse try dumps(r.a, d);
-        const own = fnv.get("description") orelse Value.null;
-        const own_text = if (own.truthy()) (try scalarText(r.a, own) orelse try dumps(r.a, own)) else "";
-        try fnv.put(r.a, "description", .{ .string = try std.fmt.allocPrint(r.a, "{s}\n{s}", .{ desc, own_text }) });
-    };
-    return .{ .object = fnv };
+    const name = src.get("name") orelse return r.refuse("a tool has no name", .{});
+    const out = try json.newObject(r.a);
+    try out.put(r.a, "name", name);
+    try out.put(r.a, "description", src.get("description") orelse .{ .string = "" });
+    try out.put(r.a, "parameters", src.get("parameters") orelse .{ .object = try json.newObject(r.a) });
+    return .{ .object = out };
 }
 
 const tools_head =
@@ -392,10 +381,6 @@ fn renderInner(a: Allocator, messages: Value, o: Options, problem: *Problem, tra
     if (o.budget < 1 or o.budget > 100) return r.refuse("reasoning_effort must be 1-100 or low / medium / high / max", .{});
     const msgs = try messagesOf(&r, messages, o);
     const drop = o.drop_thinking and !(msgs.len > 0 and msgs[0].tools);
-    var last: ?usize = null; // the last user turn (or a system message after the first)
-    for (msgs, 0..) |m, idx| if (m.role == .user or (m.role == .system and idx > 0)) {
-        last = idx;
-    };
     const thinking = o.thinking;
     try r.put(BOS);
     for (msgs, 0..) |m, idx| {
@@ -406,7 +391,6 @@ fn renderInner(a: Allocator, messages: Value, o: Options, problem: *Problem, tra
             try r.put(std.fmt.bufPrint(&buf, "{d}", .{o.budget}) catch unreachable);
             try r.put(" (range 1-100, the higher the value, the more thorough the reasoning)\n\n");
         }
-        const after_last = last == null or idx > last.?;
         switch (m.role) {
             .system => {
                 if (idx > 0) try r.put(SYSTEM);
@@ -434,25 +418,20 @@ fn renderInner(a: Allocator, messages: Value, o: Options, problem: *Problem, tra
                 try r.request(m.content);
             },
             .assistant => {
-                if (thinking and (!drop or after_last)) {
-                    try r.request(m.reasoning orelse "");
-                    try r.put(THINK_END);
+                try r.put(ASSISTANT);
+                if (thinking and !drop and m.reasoning != null) {
+                    try r.put(THINK_OPEN);
+                    try r.request(m.reasoning.?);
                 }
+                try r.put(THINK_END);
                 try r.request(m.content);
                 if (m.calls.len > 0) try renderCalls(&r, m.calls);
                 try r.put(EOS);
             },
             .tool => unreachable, // merged into user turns
         }
-        const next: ?Role = if (idx + 1 < msgs.len) msgs[idx + 1].role else null;
-        if (next) |n| if (n != .assistant and n != .latest_reminder) continue;
-        if (next == null and !o.add_generation_prompt and m.role != .assistant) continue;
-        if (m.role == .user or (m.role == .system and idx > 0)) {
-            try r.put(ASSISTANT);
-            const open = thinking and (!drop or last == null or idx >= last.?);
-            try r.put(if (open) THINK_OPEN else THINK_END);
-        }
     }
+    if (o.add_generation_prompt) try r.put(generationPrefix(thinking));
     return .{ .text = r.out.items, .spans = r.spans.items };
 }
 
