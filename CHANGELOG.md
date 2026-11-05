@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- The native streaming benchmark reads the selected model's thinking switch once. Unsupported off requests use the server default, are labelled in the receipt and remain local instead of being published as the thinking-off community protocol. Old servers keep the off request, labelled unverified.
+
 - The explicit thinking-off refusal applies to client requests. Internal compaction notes and Living Weights asks keep their existing prompt behavior when the template has no off switch.
 
 - Native model discovery reports `capabilities.thinking_switch` using the explicit-off prompt check. Decode benchmarks read it once and request off only when supported; unsupported or unknown runs are labelled as the model default (#2139, #2170).
