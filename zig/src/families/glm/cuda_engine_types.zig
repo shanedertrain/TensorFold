@@ -15,6 +15,7 @@ pub const Seq = struct {
     sampling: ?sampler.Sampling = null, // null: greedy
     in_head: usize = 0, // drafted rows the MTP caches hold past the kept ones (st.mtp_drafted)
     rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
+    gen: u64 = 0, // its number among the engine's sequences (Engine.nextGen): a verify graph's key names it
 };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.

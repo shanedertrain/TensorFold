@@ -22,6 +22,7 @@ pub const Prof = struct {
     label: []const u8 = "",
     prompt: ?*prompt_trace.Trace = null,
     every: u64 = 64, // calls a report sums
+    capture: bool = false, // a graph is recording the stream: marks become event record nodes its replays fire
 
     pub fn init(d: *const cuda.Driver, io: std.Io) !*Prof {
         return initWith(d, io, cuda.Event.init);
@@ -71,7 +72,15 @@ pub const Prof = struct {
     /// The work queued on `s` since the last mark belongs to `section`.
     pub fn mark(p: *Prof, s: cuda.Stream, section: Section) void {
         if (!p.open or p.n >= max_marks) return;
-        p.events[p.n + 1].record(s) catch return;
+        const e = p.events[p.n + 1];
+        (if (p.capture) e.recordExternal(s) else e.record(s)) catch return;
+        p.ends[p.n] = section;
+        p.n += 1;
+    }
+
+    /// A replayed graph's event node records this mark: its section is noted here, nothing is recorded.
+    pub fn note(p: *Prof, section: Section) void {
+        if (!p.open or p.n >= max_marks) return;
         p.ends[p.n] = section;
         p.n += 1;
     }

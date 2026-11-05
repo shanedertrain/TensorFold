@@ -87,10 +87,22 @@ pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize,
     try projection.matmul(set, stream, l.o, s.vn + lo * w * 2, w, out, s.mm_part, hi - lo, l.dims, w, true);
 }
 
-/// The block up to its out_proj (s.vn holds the expanded rows).
+/// The block up to its out_proj (s.vn holds the expanded rows): its head, its attention, its tail.
 pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize) !void {
+    try head(k, stream, l, c, s, x, x_stride, rows, pos, host_pos);
+    try attention(k, stream, l, c, s, 0, rows, pos, host_pos, nch, part_rows);
+    try tail(k, stream, l, s, rows);
+}
+
+/// The block's first part: the row projections (the indexer's query once a row is past the dense limit) and the
+/// cache writes. Every grid is the rows', so a verify graph may hold it (cuda_verify_graph).
+pub fn head(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize) !void {
     try prepareProfile(k.set, stream, l, s, x, x_stride, rows, sparseRows(l, host_pos, rows), k.prof);
-    try attend(k, stream, l, c, s, 0, rows, pos, host_pos, nch, part_rows);
+    try writeKeys(k, stream, l, c, s, rows, pos);
+}
+
+/// The block's last part: the latent rows expanded to values (s.vn).
+pub fn tail(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize) !void {
     const stamp = prof.span(k.prof, stream, .projections);
     defer stamp.end();
     try latent.expandV(k.set, stream, s.ol, l.wv, s.vn, rows, l.heads, l.dv, l.lw);
@@ -125,17 +137,30 @@ pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, 
 
 /// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.
 pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize) !void {
-    const set = k.set;
+    try writeKeys(k, stream, l, c, fromRow(l, s, r0), rows, pos);
+    try attention(k, stream, l, c, s, r0, rows, pos, host_pos, nch, part_rows);
+}
+
+/// The scratch from row r0.
+fn fromRow(l: Layer, s: Scratch, r0: usize) Scratch {
     const ix = l.index;
-    const kw_rows = ix.d + ix.heads;
-    var v = s; // the scratch from row r0
+    var v = s;
     v.lat += r0 * l.lw * 2;
-    v.ikr += r0 * kw_rows * 2;
+    v.ikr += r0 * (ix.d + ix.heads) * 2;
     v.igr += r0 * ix.d * 4;
     v.qa += r0 * l.heads * l.lw * 2;
     v.ol += r0 * l.heads * l.lw * 2;
     v.qi += r0 * ix.heads * ix.d * 2;
-    try writeKeys(k, stream, l, c, v, rows, pos);
+    return v;
+}
+
+/// Rows r0..r0 + rows' attention over caches already written: dense chunks under the dense limit, the sparse pass
+/// past it. Its grids and kernels follow the host position, so a verify graph runs it eagerly between two segments.
+pub fn attention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize) !void {
+    const set = k.set;
+    const ix = l.index;
+    const kw_rows = ix.d + ix.heads;
+    const v = fromRow(l, s, r0);
     const t: latent.Table = .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / (l.lw * 2) };
     const tk: latent.Table = .{ .pt = c.pt, .ps = if (c.pks != 0) c.pks else c.ps, .page_rows = t.page_rows };
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));

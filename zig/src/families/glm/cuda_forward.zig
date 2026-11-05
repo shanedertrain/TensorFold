@@ -25,6 +25,7 @@ const images_mod = @import("cuda_images.zig");
 const exl3 = @import("cuda_exl3.zig");
 const shared = @import("cuda_shared.zig");
 const index_mod = @import("cuda_index.zig");
+const vg = @import("cuda_verify_graph.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const solo_rows = state.solo_rows;
@@ -195,6 +196,7 @@ pub const Forward = struct {
     prof: ?*prof_mod.Prof = null, // TF_GLM_PROF=1: events between the sections
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
+    graph: ?*vg.Session = null, // TF_GLM_VERIFY_GRAPH: a verify window's spans recorded or replayed (cuda_verify_graph)
 
     pub fn set(f: *const Forward) glue.Set {
         return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows };
@@ -278,6 +280,32 @@ pub const Forward = struct {
             .local => null,
             .nccl => |x| .{ .lib = x.lib, .comm = x.comm, .rank = r.w.share.rank, .world = r.w.share.world },
         };
+    }
+
+    /// forward._mixer's first part on a window's MLA layer: projections, norms, indexer rows and the cache writes.
+    fn mixerHead(f: *const Forward, r: Rank, l: weights.Layer, di: usize, rows: usize) !void {
+        const a = l.mixer.mla;
+        const st = r.st;
+        try dsa_block.head(f.dsaKernels(r), f.stream, a, st.caches[di], r.b.dsa, r.b.normed, r.w.config.hidden, rows, st.pos_dev, st.pos);
+    }
+
+    /// Its attention over the caches: dense chunks or the sparse pass, their grids from the host position.
+    fn mixerAttend(f: *const Forward, r: Rank, l: weights.Layer, di: usize, rows: usize) !void {
+        const a = l.mixer.mla;
+        const st = r.st;
+        const b = r.b;
+        try dsa_block.attention(f.dsaKernels(r), f.stream, a, st.caches[di], b.dsa, 0, rows, st.pos_dev, st.pos, @min(latent.chunksFor(st.pos + rows), b.nch), b.part_rows);
+    }
+
+    /// Its tail: the latent rows expanded to values, and the o_proj partial into this rank's slot.
+    fn mixerTail(f: *const Forward, r: Rank, l: weights.Layer, rows: usize, out: u64) !void {
+        const a = l.mixer.mla;
+        try dsa_block.tail(f.dsaKernels(r), f.stream, a, r.b.dsa, rows);
+        try dsa_block.fill(f.set(), f.stream, a, r.b.dsa, 0, rows, out);
+    }
+
+    fn dsaKernels(f: *const Forward, r: Rank) dsa_block.Kernels {
+        return .{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r) };
     }
 
     /// forward._ffn: the dense MLP or MoE block on b.normed into this rank's slot.
@@ -408,6 +436,13 @@ pub const Forward = struct {
 
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
     pub fn run(f: *const Forward, ids: []const i32) !void {
+        try f.prepare(ids);
+        try f.body(ids.len);
+    }
+
+    /// What goes ahead of a forward's kernels: the sequences readied (a ring rebase) and marked pending, the ids
+    /// uploaded. Outside any graph: a capture refuses the upload, and a rebase moves pointers the kernels bake in.
+    pub fn prepare(f: *const Forward, ids: []const i32) !void {
         const R = ids.len;
         for (f.ranks) |r| {
             if (R == 0 or R > r.b.rows) return error.BadWindow;
@@ -418,53 +453,106 @@ pub const Forward = struct {
             } else try shared.begin(r, R, f.stream);
             try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
         }
+    }
+
+    /// The kernels of a forward of `R` rows (`prepare`'s ids): the embedding, the layers, the head. With `graph`
+    /// set, its spans are recorded or replayed and the MLA attention runs eagerly between them (cuda_verify_graph).
+    pub fn body(f: *const Forward, R: usize) !void {
         const c = &f.ranks[0].w.config;
-        const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
-        for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
-        if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
-        embed_stamp.end();
-        if (f.prof) |p| p.mark(f.stream, .embed);
+        var issuing = try f.spanOpen();
+        if (issuing) {
+            const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
+            for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
+            if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
+            embed_stamp.end();
+            f.mark(.embed);
+        }
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
-        try f.finish(R);
-        if (f.prof) |p| p.mark(f.stream, .head);
+        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else issuing = try f.whole(R, issuing);
+        if (issuing) {
+            try f.finish(R);
+            f.mark(.head);
+        }
+        try f.spanClose();
     }
 
-    /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
-    fn whole(f: *const Forward, R: usize) !void {
+    /// A graphable span begins: true when the body issues its kernels (eagerly, or into a recording); false: replayed.
+    pub fn spanOpen(f: *const Forward) !bool {
+        const g = f.graph orelse return true;
+        return g.open();
+    }
+
+    /// The span ends (a recording keeps it as one segment); nothing without a graph.
+    pub fn spanClose(f: *const Forward) !void {
+        const g = f.graph orelse return;
+        try g.close();
+    }
+
+    /// Whether the kernels between two spans run now: always, except in a recording pass, which leaves them to its replay.
+    pub fn eagerRegion(f: *const Forward) bool {
+        const g = f.graph orelse return true;
+        return g.eager();
+    }
+
+    /// TF_GLM_PROF's mark of the work queued so far (an event record node inside a recording).
+    fn mark(f: *const Forward, section: prof_mod.Section) void {
+        if (f.prof) |p| p.mark(f.stream, section);
+    }
+
+    /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue. A window
+    /// graph's spans are cut around each MLA layer's attention; returns whether the body still issues kernels.
+    fn whole(f: *const Forward, R: usize, issuing0: bool) !bool {
         const c = &f.ranks[0].w.config;
+        var issuing = issuing0;
         var li: usize = 0;
         var di: usize = 0;
         for (f.ranks[0].w.layers, 0..) |_, j| {
             prof_mod.context(f.prof, j, null, .mixer);
-            for (f.ranks) |r| {
-                const l = r.w.layers[j];
-                try f.pre(r, l.attn_hc, l.in_norm, R);
-                if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
+            const mla = f.ranks[0].w.layers[j].mixer == .mla;
+            // a window's MLA layer in three parts: its attention's grids follow the host position, so it stays eager
+            const cutting = mla and f.ranks[0].segs.len == 0;
+            if (issuing) {
+                for (f.ranks) |r| {
+                    const l = r.w.layers[j];
+                    try f.pre(r, l.attn_hc, l.in_norm, R);
+                    if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else if (cutting) try f.mixerHead(r, l, di, R) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
+                }
             }
-            if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
-            try f.gather(R);
-            if (f.prof) |p| p.mark(f.stream, .gather_a);
-            prof_mod.context(f.prof, j, null, .ffn);
-            for (f.ranks) |r| {
-                const l = r.w.layers[j];
-                try f.post(r, R);
-                try f.pre(r, l.ffn_hc, l.post_norm, R);
-                try f.ffn(r, l, R, slot(r, R));
+            if (cutting) {
+                try f.spanClose();
+                if (f.eagerRegion()) {
+                    for (f.ranks) |r| try f.mixerAttend(r, r.w.layers[j], di, R);
+                }
+                issuing = try f.spanOpen();
+                if (issuing) {
+                    for (f.ranks) |r| try f.mixerTail(r, r.w.layers[j], R, slot(r, R));
+                }
             }
-            if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
-            try f.gather(R);
-            for (f.ranks) |r| try f.post(r, R);
-            if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, 0, R);
-            if (f.prof) |p| p.mark(f.stream, .gather_b);
-            switch (f.ranks[0].w.layers[j].mixer) {
-                .kda => li += 1,
-                .mla => di += 1,
+            if (issuing) {
+                f.mark(if (mla) .mla else .kda);
+                try f.gather(R);
+                f.mark(.gather_a);
+                prof_mod.context(f.prof, j, null, .ffn);
+                for (f.ranks) |r| {
+                    const l = r.w.layers[j];
+                    try f.post(r, R);
+                    try f.pre(r, l.ffn_hc, l.post_norm, R);
+                    try f.ffn(r, l, R, slot(r, R));
+                }
+                f.mark(if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
+                try f.gather(R);
+                for (f.ranks) |r| try f.post(r, R);
+                if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, 0, R);
+                f.mark(.gather_b);
             }
+            if (mla) di += 1 else li += 1;
         }
-        for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
+        if (issuing) {
+            for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
+        }
+        return issuing;
     }
 
     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).

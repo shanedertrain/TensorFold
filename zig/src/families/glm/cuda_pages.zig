@@ -32,7 +32,7 @@ pub fn ownSequence(e: *Engine) !void {
     if (e.seqs.items[0] != null) return error.SlotTaken;
     const q = try e.gpa.create(types.Seq);
     errdefer e.gpa.destroy(q);
-    q.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, on(e, 0, state.pageBytes(&e.w))) };
+    q.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, on(e, 0, state.pageBytes(&e.w))), .gen = e.nextGen() };
     e.seqs.items[0] = q;
     e.cur = q;
     e.slot = 0;
@@ -110,7 +110,7 @@ pub const Pages = struct {
             if (q.* != null) return error.SlotTaken; // attach comes before any stream
             const s = try e.gpa.create(types.Seq);
             errdefer e.gpa.destroy(s);
-            s.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, at) };
+            s.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, at), .gen = e.nextGen() };
             q.* = s;
             made += 1;
         }

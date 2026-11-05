@@ -48,6 +48,7 @@ test {
     _ = @import("cuda_kv8_test.zig");
     _ = kv8_ref;
     _ = @import("cuda_prof.zig");
+    _ = @import("cuda_verify_graph.zig");
     _ = @import("cuda_load_owner.zig");
     _ = @import("cuda_images_interleave_test.zig");
     _ = @import("cuda_pages_test.zig");

@@ -18,6 +18,7 @@ const mm_mod = @import("cuda_mm.zig");
 const dflash = @import("dflash.zig");
 const prof_mod = @import("cuda_prof.zig");
 const pages_mod = @import("cuda_pages.zig");
+const vg = @import("cuda_verify_graph.zig");
 pub const Options = @import("cuda_engine_types.zig").Options;
 
 /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
@@ -98,6 +99,9 @@ pub const Engine = struct {
     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
     share_pages: bool = false, // TF_GLM_KV_SHARE: a kept state leaves its prefix's pages to the prompt cache that holds them
+    graphs: ?*vg.Graphs = null, // TF_GLM_VERIFY_GRAPH=1: verify windows replayed from CUDA graphs, made at the first verify
+    graphs_tried: bool = false, // that first verify looked (and may have declined them: vision, TF_GLM_KV_HOST)
+    seq_gen: u64 = 0, // the last Seq.gen handed out (bind, cuda_pages): binds happen in step, so every rank hands out the same
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -213,6 +217,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
+        if (e.graphs) |g| g.destroy();
         e.gpa.free(e.packs.ptrs);
         e.gpa.free(e.packs.bits);
         if (e.drafter) |dr| dr.deinit();
@@ -271,12 +276,19 @@ pub const Engine = struct {
         if (made) {
             const q = try e.gpa.create(Seq);
             errdefer e.gpa.destroy(q);
-            q.* = .{ .st = try fw.State.initFormat(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8) };
+            q.* = .{ .st = try fw.State.initFormat(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8), .gen = e.nextGen() };
             e.seqs.items[slot] = q;
         }
         e.cur = e.seqs.items[slot].?;
         e.slot = slot;
         if (e.images) |v| try v.activate(slot);
+    }
+
+    /// The next sequence's number (Seq.gen): a verify graph's key names the sequence by it, never by an address a
+    /// freed one may hand on, and the ranks bind in step, so each hands out the same numbers.
+    pub fn nextGen(e: *Engine) u64 {
+        e.seq_gen += 1;
+        return e.seq_gen;
     }
 
     /// Frees slot `slot`'s sequence (slot 0 stays, and a paged one gives its pages back) and binds slot 0.
@@ -474,7 +486,7 @@ pub const Engine = struct {
         const at = e.cur.st.pos;
         f.prof = e.profs[ids.len - 1];
         if (f.prof) |p| try p.begin(e.stream, verifyLabel(ids.len));
-        try f.run(@ptrCast(ids));
+        if (try e.verifyGraphs()) |g| try g.forward(&f, @ptrCast(ids), e.cur.gen) else try f.run(@ptrCast(ids));
         if (e.drafter) |dr| try dr.noteVerify(e.slot, 0, ids.len, at, true);
         e.cur.rows_at = e.bd.fnormed;
         try e.draw(e.bd.logits, ids.len, at + 1, bits, out);
@@ -576,6 +588,30 @@ pub const Engine = struct {
     /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
     const greedy = @import("cuda_engine_pick.zig").greedy;
     const greedyChance = @import("cuda_engine_pick.zig").greedyChance;
+
+    /// TF_GLM_VERIFY_GRAPH=1's graphs, made at the first verify; null when off, or when this engine's windows carry
+    /// what a capture cannot hold (image rows spliced on the host, TF_GLM_KV_HOST's gathers).
+    fn verifyGraphs(e: *Engine) !?*vg.Graphs {
+        if (e.graphs) |g| return g;
+        if (e.graphs_tried or !vg.enabled()) return null;
+        e.graphs_tried = true;
+        if (e.images != null or @import("cuda_kv_host.zig").active != null) {
+            std.log.warn("TF_GLM_VERIFY_GRAPH: not used with --vision or TF_GLM_KV_HOST; verify windows run eagerly", .{});
+            return null;
+        }
+        const g = try vg.Graphs.create(e.gpa, e.d, vg.maxGraphs());
+        g.agree = .{ .ctx = e, .all = agreeGraphs };
+        e.graphs = g;
+        if (e.share.rank == 0) std.log.info("glm: verify windows through CUDA graphs (TF_GLM_VERIFY_GRAPH=1), up to {d} held", .{g.max});
+        return g;
+    }
+
+    /// cuda_verify_graph's rank agreement: every rank's verdict, through the ranks' maximum (`shared`).
+    fn agreeGraphs(ctx: *anyopaque, ok: bool) anyerror!bool {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        if (e.share.world < 2) return ok;
+        return (try e.shared(if (ok) 0 else 1)) == 0;
+    }
 
     /// A failed RoCE gather (its rows hold nothing) or TF_GLM_KV_HOST gather past its slots, after a synchronize.
     pub fn checkGathers(e: *const Engine) !void {
