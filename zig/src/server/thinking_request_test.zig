@@ -79,6 +79,8 @@ fn capability(srv: *Server, a: Allocator) !bool {
     var found: ?bool = null;
     for (body.get("data").?.array) |entry| {
         const caps = entry.get("capabilities") orelse return error.MissingThinkingCapability;
+        const applicable = caps.get("thinking_applicable") orelse return error.MissingThinkingApplicability;
+        try std.testing.expectEqual(srv.close_id != null, applicable.bool);
         const bit = caps.get("thinking_switch") orelse return error.MissingThinkingCapability;
         try std.testing.expect(bit == .bool);
         if (found) |previous| try std.testing.expectEqual(previous, bit.bool);

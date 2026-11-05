@@ -4,13 +4,15 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Decode receipts report thinking as `not applicable` when the model has no thinking-close marker. Model discovery exposes `capabilities.thinking_applicable`, separately from its off switch. The single-stream prompt keeps its existing `gpu-chat-no-think` name.
+
 - The Python decode clients keep requesting thinking off when an old server has no switch capability, labelled `off requested (unverified)`. `--compare-receipt FILE` flags rows with different thinking labels instead of silently comparing their rates.
 
 - The native streaming benchmark reads the selected model's thinking switch once. Unsupported off requests use the server default, are labelled in the receipt and remain local instead of being published as the thinking-off community protocol. Old servers keep the off request, labelled unverified.
 
 - The explicit thinking-off refusal applies to client requests. Internal compaction notes and Living Weights asks keep their existing prompt behavior when the template has no off switch.
 
-- Native model discovery reports `capabilities.thinking_switch` using the explicit-off prompt check. Decode benchmarks read it once and request off only when supported; unsupported or unknown runs are labelled as the model default (#2139, #2170).
+- Native model discovery reports `capabilities.thinking_switch` using the explicit-off prompt check. Decode benchmarks read it once; unsupported off requests use the model default, and older servers retain an explicitly labelled unverified off request (#2139, #2170).
 
 - GLM-5.3-Flash on a Mac without tensor units learns what a shared round's row costs on that chip instead of pricing it from an M5 Ultra's table, so an M3 Ultra stops over-drafting with several requests at once: about 14% more at four streams when drafts land often, with the same tokens (measured on 40 of the 45 layers).
 

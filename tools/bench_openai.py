@@ -28,7 +28,7 @@ if sys.version_info < (3, 11):
 PROMPTS = [
     {"name": "fibonacci-raw", "kind": "completion",
      "prompt": "Write a short Python function that computes the Fibonacci sequence and explain it."},
-    {"name": "gpu-chat", "kind": "chat",
+    {"name": "gpu-chat-no-think", "kind": "chat",
      "prompt": "Explain how matrix multiplication uses a GPU in plain English, then give a small numerical example."},
 ]
 

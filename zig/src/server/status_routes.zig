@@ -84,7 +84,7 @@ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
         null;
     const off_switch = try @import("prompt.zig").thinkingSwitch(srv, a);
     for (srv.config.model_ids, data) |id, *slot| {
-        slot.* = try modelValue(a, id, srv.info, created, reasoning, off_switch);
+        slot.* = try modelValue(a, id, srv.info, created, reasoning, off_switch, srv.close_id != null);
     }
     const o = try json.newObject(a);
     try o.put(a, "object", .{ .string = "list" });
@@ -93,7 +93,7 @@ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
 }
 
 /// Discovery extensions report the loaded engine's prompt-plus-reply limit; zero leaves it unspecified.
-fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64, reasoning: ?Value, off_switch: bool) Allocator.Error!Value {
+fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64, reasoning: ?Value, off_switch: bool, thinking_applicable: bool) Allocator.Error!Value {
     const m = try json.newObject(a);
     try m.put(a, "id", .{ .string = id });
     try m.put(a, "object", .{ .string = "model" });
@@ -106,6 +106,7 @@ fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64, reason
     if (reasoning) |r| try m.put(a, "reasoning", r);
     const capabilities = try json.newObject(a);
     try capabilities.put(a, "thinking_switch", .{ .bool = off_switch });
+    try capabilities.put(a, "thinking_applicable", .{ .bool = thinking_applicable });
     try m.put(a, "capabilities", .{ .object = capabilities });
     return .{ .object = m };
 }
@@ -268,7 +269,7 @@ test "model discovery reports fitted engine context equally for its served name 
     defer arena.deinit();
     const info: api.Info = .{ .context_window = 8192, .context_fitted = true };
     for ([_][]const u8{ "served-model", "model-alias" }) |id| {
-        const value = try modelValue(arena.allocator(), id, info, 123, null, false);
+        const value = try modelValue(arena.allocator(), id, info, 123, null, false, false);
         try std.testing.expectEqualStrings(id, value.get("id").?.string);
         try std.testing.expectEqual(@as(i64, 8192), value.get("context_length").?.int64().?);
         try std.testing.expectEqual(value.get("context_length").?.int64(), value.get("max_model_len").?.int64());
@@ -279,10 +280,10 @@ test "model discovery reports fitted engine context equally for its served name 
 test "model discovery omits an unspecified context and preserves the full u32 limit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const unlimited = try modelValue(arena.allocator(), "model", .{}, 0, null, false);
+    const unlimited = try modelValue(arena.allocator(), "model", .{}, 0, null, false, false);
     try std.testing.expect(unlimited.get("context_length") == null);
     try std.testing.expect(unlimited.get("max_model_len") == null);
-    const bounded = try modelValue(arena.allocator(), "model", .{ .context_window = std.math.maxInt(u32) }, 0, null, false);
+    const bounded = try modelValue(arena.allocator(), "model", .{ .context_window = std.math.maxInt(u32) }, 0, null, false, false);
     try std.testing.expectEqual(@as(i64, std.math.maxInt(u32)), bounded.get("max_model_len").?.int64().?);
 }
 
@@ -290,9 +291,9 @@ test "model discovery adds reasoning to an entry only when the model has it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const plain = try modelValue(a, "model", .{}, 0, null, false);
+    const plain = try modelValue(a, "model", .{}, 0, null, false, false);
     try std.testing.expect(plain.get("reasoning") == null);
-    const thinking = try modelValue(a, "model", .{}, 0, try reasoningValue(a, true, true, null, &.{"low"}), true);
+    const thinking = try modelValue(a, "model", .{}, 0, try reasoningValue(a, true, true, null, &.{"low"}), true, true);
     try std.testing.expect(thinking.get("reasoning").?.get("default_enabled").?.bool);
 }
 

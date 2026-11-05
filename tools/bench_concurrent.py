@@ -263,11 +263,13 @@ def main() -> None:
             pool = distinct(args.prompts)
         except (OSError, ValueError) as exc:
             p.error(str(exc))
-    switch = bench_thinking.discover(args.base, args.model, api_key)
-    pool = bench_thinking.configure(pool, switch)
+    capabilities = bench_thinking.discover(args.base, args.model, api_key)
+    switch = capabilities["thinking_switch"]
+    pool = bench_thinking.configure(pool, capabilities)
     cells = [None] if args.mixed or args.prompts else pool
     report: dict = {"label": args.label, "tokens": args.tokens, "mixed": args.mixed, "cells": []}
     report["thinking_switch"] = switch
+    report["thinking_applicable"] = capabilities["thinking_applicable"]
     if args.prompts:
         report["prompts"] = [q["name"] for q in pool]
     for temp in temps:

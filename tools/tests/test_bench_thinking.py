@@ -83,6 +83,27 @@ class ThinkingDiscovery(unittest.TestCase):
                     if req.data:
                         self.assertEqual(json.loads(req.data).get("chat_template_kwargs"), {"enable_thinking": False} if "messages" in json.loads(req.data) else None)
 
+    def test_nonreasoning_chat_is_not_applicable(self):
+        for module in (bench_openai, bench_concurrent):
+            item = {**module.PROMPTS[1], "thinking_switch": True, "thinking_applicable": False}
+            self.assertEqual(bench_thinking.receipt(item)["thinking"], "not applicable")
+            with patch.object(module.urllib.request, "urlopen", return_value=response()) as http:
+                module.stream("http://unused", "fixture", item, 4, 0, 1)
+                self.assertNotIn("chat_template_kwargs", json.loads(http.call_args.args[0].data))
+
+    def test_discovered_no_thinking_labels_both_clients_not_applicable(self):
+        document = {"data": [{"id": "fixture", "capabilities": {"thinking_switch": True, "thinking_applicable": False}}]}
+        for module in (bench_openai, bench_concurrent):
+            seen, report = self.run_cli(module, True, document=document)
+            for request in seen:
+                if request.data:
+                    self.assertNotIn("chat_template_kwargs", json.loads(request.data))
+            rows = report if module is bench_openai else report["cells"]
+            self.assertTrue(all(row["thinking"] == "not applicable" for row in rows))
+
+    def test_single_stream_prompt_name_stays_stable(self):
+        self.assertEqual(bench_openai.PROMPTS[1]["name"], "gpu-chat-no-think")
+
     def test_comparison_flags_different_modes_and_accepts_matching_modes(self):
         row = {"prompt": "gpu-chat-no-think", "temperature": 0, "thinking": "off requested (unverified)"}
         old = {"prompt": "gpu-chat", "temperature": 0, "thinking": "off"}
