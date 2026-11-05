@@ -93,7 +93,13 @@ const closed = "H{% if add_generation_prompt %}<think></think>{% endif %}";
 const switched = "H{% if add_generation_prompt %}{% if enable_thinking %}<think>{% else %}</think>{% endif %}{% endif %}";
 const off = ",\"chat_template_kwargs\":{\"enable_thinking\":false}";
 
+const Source = enum { client, ask, ask_in };
+
 fn check(template: []const u8, close_token: bool, server_thinking: bool, extra: []const u8, code: u16, ids: []const u32) !void {
+    return checkSource(template, close_token, server_thinking, extra, code, ids, .client);
+}
+
+fn checkSource(template: []const u8, close_token: bool, server_thinking: bool, extra: []const u8, code: u16, ids: []const u32, source: Source) !void {
     const t = std.testing;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
@@ -118,6 +124,22 @@ fn check(template: []const u8, close_token: bool, server_thinking: bool, extra: 
     const can_off = try capability(srv, a);
     try t.expect(!script.seen);
     if (code == 400) try t.expect(!can_off) else if (std.mem.eql(u8, extra, off)) try t.expect(can_off);
+    if (source != .client) {
+        var cx: @import("errors.zig").Cx = .{ .a = a };
+        const Stay = struct {
+            pub fn check(_: @This()) bool {
+                return false;
+            }
+        };
+        const reply = if (source == .ask)
+            try @import("slide_ask.zig").ask(srv, &cx, null, "H", 2, Stay{})
+        else
+            try @import("slide_ask.zig").askIn(srv, &cx, &.{.{ "H", "K" }}, "H", 2, true, Stay{});
+        try t.expectEqualStrings("K", reply.content);
+        try t.expect(script.seen);
+        try t.expectEqualSlices(u32, ids, script.prompt[0..script.count]);
+        return;
+    }
     const body = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"messages\":[{{\"role\":\"user\",\"content\":\"H\"}}],\"max_tokens\":2,\"return_token_ids\":true{s}}}", .{extra}))).ok;
     var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
     var response: Reply = .{ .a = a };
@@ -156,4 +178,12 @@ test "thinking request: switched, already closed and closable prefixes keep thei
         try check(closed, true, default, off, 200, &.{ 0, 300, 301 });
         try check(dangling, true, default, off, 200, &.{ 0, 300, 301 });
     }
+}
+
+test "thinking request: internal lesson ask keeps main behavior without an off switch" {
+    try checkSource(plain, true, true, "", 200, &.{0}, .ask);
+}
+
+test "thinking request: internal lesson askIn keeps main behavior without an off switch" {
+    try checkSource(plain, true, true, "", 200, &.{0}, .ask_in);
 }

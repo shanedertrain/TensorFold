@@ -145,7 +145,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         .ids => |ids| return .{ .ids = ids },
     };
     const asked = input.fields.field("enable_thinking");
-    const require_off = asked != null and asked.? == .bool and !asked.?.bool;
+    const require_off = input.client_request and asked != null and asked.? == .bool and !asked.?.bool;
     const prompt = try renderRequest(srv, cx, input.messages, input.tools, thinking, effort, true, require_off);
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;
