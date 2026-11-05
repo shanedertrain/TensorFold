@@ -12,6 +12,7 @@ pub const Switch = enum {
     TF_FLASHNEXT_KV_PAGES,
     TF_FLASHNEXT_KV_PAGES_ALL,
     TF_KV_PAGES,
+    TF_CUDA_PINNED_DOWNLOAD,
 };
 pub const Syntax = enum { count, one, auto };
 pub const Entry = struct {
@@ -51,6 +52,8 @@ pub const Entry = struct {
 
 const qwen: []const []const u8 = &.{ "qwen3_5", "qwen3_5_moe" };
 const flash: []const []const u8 = &.{"qwen4_exp"};
+/// Every model type the native CUDA engine registers; native/cuda.zig's family test holds this list to it.
+pub const cuda_families: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni", "glm5_next", "minimax_m3_vl", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "kolibri1", "gemma4_unified", "gemma4", "spark2_5", "dory", "lfm2_vl", "fish_omni", "qwen4", "qwen4_text" };
 
 pub const entries = [_]Entry{
     .{ .id = .TF_QWEN_KV_PAGES, .families = qwen, .class = .identical, .effect = "KV pool page size; memory and workload tradeoffs", .evidence = "#1357" },
@@ -62,6 +65,7 @@ pub const entries = [_]Entry{
     .{ .id = .TF_FLASHNEXT_KV_PAGES_ALL, .families = flash, .class = .debug, .syntax = .one, .effect = "Put every stream on pool pages for checks", .evidence = "#1660" },
     .{ .id = .TF_KV_PAGES, .families = &.{"glm5_next"}, .class = .identical, .syntax = .auto, .effect = "GLM KV pool pages; auto from two ranks with BF16, windows with FP8", .evidence = "#1322" },
     .{ .id = .TF_KV_PAGES, .families = &.{ "nemotron_h", "nemotron_h_omni" }, .class = .identical, .report_values = &.{ "0", "all" }, .effect = "Nemotron KV pool pages by default; exact 0 disables, exact all pages every stream", .evidence = "#781" },
+    .{ .id = .TF_CUDA_PINNED_DOWNLOAD, .families = cuda_families, .class = .identical, .syntax = .one, .effect = "Exact 1 stages DeviceBuffer.download through reused pinned memory", .evidence = "#2102" },
 };
 
 comptime {
