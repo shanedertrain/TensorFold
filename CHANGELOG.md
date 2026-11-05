@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- The Python decode clients keep requesting thinking off when an old server has no switch capability, labelled `off requested (unverified)`. `--compare-receipt FILE` flags rows with different thinking labels instead of silently comparing their rates.
+
 - The native streaming benchmark reads the selected model's thinking switch once. Unsupported off requests use the server default, are labelled in the receipt and remain local instead of being published as the thinking-off community protocol. Old servers keep the off request, labelled unverified.
 
 - The explicit thinking-off refusal applies to client requests. Internal compaction notes and Living Weights asks keep their existing prompt behavior when the template has no off switch.

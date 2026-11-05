@@ -67,7 +67,7 @@ def failed_run(item: dict, seed: int | None, error: str) -> dict:
     return {"prompt": item["name"], "seed": seed, "sent": None, "first": None, "last": None, "tokens": None,
             "pieces": [], "ttft_s": None, "decode_tps": None, "token_sha": None, "token_sha256": None,
             "completed": None, "error": error, "complete": False, "prompt_tokens": None,
-            "cached_tokens": None, "cache_state": "unverified", "output_sha256": None}
+            "cached_tokens": None, "cache_state": "unverified", "output_sha256": None, **bench_thinking.receipt(item)}
 
 
 def _stream(base: str, model: str, item: dict, tokens: int, temperature: float, seed: int | None, draft: bool,
@@ -83,7 +83,7 @@ def _stream(base: str, model: str, item: dict, tokens: int, temperature: float, 
     if item["kind"] == "chat":
         url = base + "/v1/chat/completions"
         body["messages"] = [{"role": "user", "content": item["prompt"]}]
-        if item.get("thinking_switch") is True:
+        if bench_thinking.request_off(item):
             body["chat_template_kwargs"] = {"enable_thinking": False}
     else:
         url = base + "/v1/completions"
@@ -134,7 +134,7 @@ def _stream(base: str, model: str, item: dict, tokens: int, temperature: float, 
             out["unmeasured"] = True
     else:
         out["unmeasured"] = True
-    return {**out, **bench_timing.request(out), **bench_metrics.request(out)}
+    return {**out, **bench_timing.request(out), **bench_metrics.request(out), **bench_thinking.receipt(item)}
 
 
 def together(base: str, model: str, specs: list[tuple[dict, int | None]], tokens: int, temperature: float,
@@ -230,6 +230,7 @@ def main() -> None:
                    help="one cell where request i sends item i %% len of this JSON list (tools/bench_prompts.json)")
     p.add_argument("--label", default="")
     p.add_argument("--output")
+    p.add_argument("--compare-receipt", metavar="FILE", help="flag rows whose thinking label differs from this receipt")
     p.add_argument("--api-key-env", metavar="NAME", help="read the bearer API key from this environment variable")
     args = p.parse_args()
     if args.tokens < 1:
@@ -247,6 +248,10 @@ def main() -> None:
     api_key = read_api_key(p, args.api_key_env)
     if not args.mixed:
         validate_temperatures(p, args.temperatures)
+    try:
+        previous = bench_thinking.load_comparison(args.compare_receipt)
+    except (OSError, ValueError, TypeError):
+        p.error("cannot read comparison receipt")
     if args.no_seed:
         args.alone = args.serial = False
     temps = [1.0] if args.mixed else [float(t) for t in args.temperatures.split(",")]
@@ -297,7 +302,8 @@ def main() -> None:
                     rep["per_stream_tps"] = [round(r["decode_tps"], 1) for r in runs if r["decode_tps"] is not None]
                     rep["ttft_s"] = [round(r["ttft_s"], 2) if r["ttft_s"] is not None else None for r in runs]
                     rep["errors"] = [r["error"] for r in runs if r.get("error")]
-                    rep["requests"] = [{k: r.get(k) for k in ("prompt_tokens", "ttft_s", "decode_tps", *METRICS)}
+                    rep["thinking_modes"] = sorted({r["thinking"] for r in runs if "thinking" in r})
+                    rep["requests"] = [{k: r.get(k) for k in ("prompt_tokens", "ttft_s", "decode_tps", "thinking", "thinking_off_requested", *METRICS)}
                                        for r in runs]
                     rep["pooled"] = bench_metrics.pooled(runs)
                     rep["evidence"] = [{k: r.get(k) for k in ("prompt_tokens", "cached_tokens", "tokens",
@@ -309,7 +315,7 @@ def main() -> None:
                     if alone:
                         # None: the request or its solo run failed (not an exactness result)
                         rep["equal_alone"] = [token_equal(alone[(r["prompt"], r["seed"])], r) for r in runs]
-                        fields = ("tokens", "token_sha256", "output_sha256", "complete", "error")
+                        fields = ("tokens", "token_sha256", "output_sha256", "complete", "error", "thinking")
                         rep["comparisons"] = []
                         for r in runs:
                             ref = alone[(r["prompt"], r["seed"])]
@@ -345,6 +351,9 @@ def main() -> None:
                 errors = sorted({e for r in reps for e in r["errors"]})
                 if errors:
                     cell["errors"] = errors[:3]
+                if item is None:
+                    cell["thinking_modes"] = sorted({mode for rep in reps for mode in rep.get("thinking_modes", [])})
+                cell = bench_thinking.comparison(cell, previous)
                 print(json.dumps(redact({"label": args.label, **cell}, api_key)), flush=True)
                 report["cells"].append({**cell, "reps": reps})
     if args.output:
